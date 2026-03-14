@@ -1,9 +1,16 @@
 fastapi
 uvicorn[standard]
 sqlalchemy
+psycopg2-binary
 python-jose[cryptography]
 passlib[bcrypt]
 bcrypt==4.0.1
 python-multipart
 pydantic[email]
 python-dotenv
+anthropic>=0.39.0
+slowapi
+
+# 테스트
+pytest
+httpx
