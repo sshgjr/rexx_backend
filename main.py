@@ -1,43 +1,28 @@
-from datetime import datetime, timedelta, timezone
-import os
+import json
+from typing import Optional, List
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordBearer
-from jose import JWTError, jwt
-from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr
-from sqlalchemy import create_engine, Column, Integer, String
-from sqlalchemy.orm import sessionmaker, declarative_base, Session
+from sqlalchemy.orm import Session
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+
+from database import Base, engine, get_db
+from auth import (
+    User,
+    hash_password,
+    verify_password,
+    create_access_token,
+    get_user_by_email,
+    get_current_user,
+)
 
 # =========================
 # 환경변수 로드
 # =========================
 load_dotenv()
-
-SECRET_KEY = os.getenv("SECRET_KEY", "change_this_secret_key")
-ALGORITHM = os.getenv("ALGORITHM", "HS256")
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./test.db")
-
-# SQLite 전용 옵션
-connect_args = {}
-if DATABASE_URL.startswith("sqlite"):
-    connect_args = {"check_same_thread": False}
-
-# =========================
-# DB 설정
-# =========================
-engine = create_engine(DATABASE_URL, connect_args=connect_args)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
-# =========================
-# 비밀번호 해싱 / JWT
-# =========================
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
 
 # =========================
 # FastAPI 앱
@@ -47,23 +32,13 @@ app = FastAPI()
 # Flutter에서 접근 가능하게 CORS 허용
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 나중엔 앱 도메인/웹 도메인만 허용하는 게 좋음
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# =========================
-# DB 모델
-# =========================
-class User(Base):
-    __tablename__ = "users"
-
-    id = Column(Integer, primary_key=True, index=True)
-    username = Column(String(50), nullable=False)
-    email = Column(String(100), unique=True, index=True, nullable=False)
-    hashed_password = Column(String(255), nullable=False)
-
+# DB 테이블 생성
 Base.metadata.create_all(bind=engine)
 
 # =========================
@@ -73,6 +48,10 @@ class RegisterRequest(BaseModel):
     username: str
     email: EmailStr
     password: str
+    height: Optional[float] = None
+    weight: Optional[float] = None
+    is_body_public: Optional[bool] = False
+    interests: Optional[List[str]] = None
 
 class LoginRequest(BaseModel):
     email: EmailStr
@@ -82,6 +61,10 @@ class UserResponse(BaseModel):
     id: int
     username: str
     email: EmailStr
+    height: Optional[float] = None
+    weight: Optional[float] = None
+    is_body_public: bool = False
+    interests: Optional[List[str]] = None
 
 class AuthResponse(BaseModel):
     success: bool
@@ -92,57 +75,16 @@ class MeResponse(BaseModel):
     success: bool
     user: UserResponse
 
-# =========================
-# DB 의존성
-# =========================
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-# =========================
-# 유틸 함수
-# =========================
-def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
-
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
-
-from typing import Optional
-
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    to_encode = data.copy()
-    expire = datetime.now(timezone.utc) + (
-        expires_delta if expires_delta else timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    )
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
-def get_user_by_email(db: Session, email: str):
-    return db.query(User).filter(User.email == email).first()
-
-def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="유효하지 않은 토큰입니다.",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        email: str | None = payload.get("sub")
-        if email is None:
-            raise credentials_exception
-    except JWTError:
-        raise credentials_exception
-
-    user = get_user_by_email(db, email)
-    if user is None:
-        raise credentials_exception
-    return user
+def _user_response(user: User) -> dict:
+    return {
+        "id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "height": user.height,
+        "weight": user.weight,
+        "is_body_public": user.is_body_public,
+        "interests": json.loads(user.interests) if user.interests else None,
+    }
 
 # =========================
 # 테스트용 라우트
@@ -168,22 +110,17 @@ def register(data: RegisterRequest, db: Session = Depends(get_db)):
         username=data.username,
         email=data.email,
         hashed_password=hash_password(data.password),
+        height=data.height,
+        weight=data.weight,
+        is_body_public=data.is_body_public if data.is_body_public is not None else False,
+        interests=json.dumps(data.interests) if data.interests else None,
     )
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
 
     access_token = create_access_token(data={"sub": new_user.email})
-
-    return {
-        "success": True,
-        "token": access_token,
-        "user": {
-            "id": new_user.id,
-            "username": new_user.username,
-            "email": new_user.email,
-        },
-    }
+    return {"success": True, "token": access_token, "user": _user_response(new_user)}
 
 # =========================
 # 로그인
@@ -202,11 +139,7 @@ def login(data: LoginRequest, db: Session = Depends(get_db)):
     return {
         "success": True,
         "token": access_token,
-        "user": {
-            "id": user.id,
-            "username": user.username,
-            "email": user.email,
-        },
+        "user": _user_response(user),
     }
 
 # =========================
@@ -216,9 +149,13 @@ def login(data: LoginRequest, db: Session = Depends(get_db)):
 def get_me(current_user: User = Depends(get_current_user)):
     return {
         "success": True,
-        "user": {
-            "id": current_user.id,
-            "username": current_user.username,
-            "email": current_user.email,
-        },
+        "user": _user_response(current_user),
     }
+
+# =========================
+# 자세 평가 라우터
+# =========================
+from routers.pose_feedback import router as pose_router, limiter
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.include_router(pose_router)
